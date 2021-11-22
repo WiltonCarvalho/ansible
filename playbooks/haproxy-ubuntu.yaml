@@ -1,0 +1,147 @@
+- hosts: local
+  connection: local
+  gather_facts: no
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+  handlers:
+    - name: 'restart rsyslog'
+      service:
+        name: rsyslog
+        state: restarted
+    - name: 'reload haproxy'
+      service:
+        name: haproxy
+        state: reloaded
+  tasks:
+    - name: 'install packages'
+      apt:
+        name: "{{ packages }}"
+        update_cache: no
+      vars:
+        packages:
+        #- linux-virtual-hwe-20.04
+        - haproxy
+        - ssl-cert
+
+    - name: '/etc/haproxy/certs'
+      file: 
+        path: "/etc/haproxy/certs"
+        state: directory
+
+    - name: 'check ssl-cert-snakeoil'
+      shell: test -f /etc/haproxy/certs/ssl-cert-snakeoil.pem
+      register: snakeoil_check
+      failed_when: snakeoil_check.rc > 1
+      changed_when: snakeoil_check.rc > 0
+
+    - name: 'ssl-cert-snakeoil'
+      shell: |
+        cat /etc/ssl/private/ssl-cert-snakeoil.key /etc/ssl/certs/ssl-cert-snakeoil.pem > /etc/haproxy/certs/ssl-cert-snakeoil.pem
+        #cat /etc/ssl/example_ca/example.key /etc/ssl/example_ca/example.pem /etc/ssl/example_ca/example_ca.pem > /etc/haproxy/certs/example.pem
+      when: snakeoil_check.rc > 0
+
+    - name: 'Sysctl Conf'
+      sysctl:
+        name: "{{item}}"
+        value: '1'
+        sysctl_file: /etc/sysctl.d/999-custom.conf
+        reload: yes
+      with_items:
+        - net.ipv4.ip_nonlocal_bind
+
+    - name: '/etc/haproxy/haproxy.cfg'
+      copy:
+        dest: /etc/haproxy/haproxy.cfg
+        backup: yes
+        content: |
+          global
+              log /dev/log    local0
+              log /dev/log    local1 notice
+              chroot /var/lib/haproxy
+              stats socket /run/haproxy/admin.sock mode 660 level admin expose-fd listeners
+              stats timeout 30s
+              user haproxy
+              group haproxy
+              daemon
+              # Default SSL material locations
+              ca-base /etc/ssl/certs
+              crt-base /etc/ssl/private
+              # See: https://ssl-config.mozilla.org/#server=haproxy&server-version=2.0.3&config=intermediate
+              ssl-default-bind-ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384
+              ssl-default-bind-ciphersuites TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256
+              ssl-default-bind-options ssl-min-ver TLSv1.2 no-tls-tickets
+              tune.ssl.default-dh-param 2048
+          defaults
+              log     global
+              mode    http
+              option  httplog
+              option  dontlognull
+              timeout connect 5000
+              timeout client  50000
+              timeout server  50000
+              errorfile 400 /etc/haproxy/errors/400.http
+              errorfile 403 /etc/haproxy/errors/403.http
+              errorfile 408 /etc/haproxy/errors/408.http
+              errorfile 500 /etc/haproxy/errors/500.http
+              errorfile 502 /etc/haproxy/errors/502.http
+              errorfile 503 /etc/haproxy/errors/503.http
+              errorfile 504 /etc/haproxy/errors/504.http
+          frontend web
+              bind 0.0.0.0:80 name http
+              bind 0.0.0.0:443 name https ssl crt /etc/haproxy/certs/ ssl-min-ver TLSv1.2 alpn h2,http/1.1
+              mode http
+              default_backend not-found
+              option forwardfor
+              option dontlog-normal
+              http-request capture req.hdr(Host) len 10
+              http-request capture req.hdr(User-Agent) len 100
+              #Stats
+              acl network_allowed src 192.168.122.0/24
+              acl uri_is_stats path_beg /stats
+              use_backend stats if uri_is_stats network_allowed
+              #WhoAmI Web Server
+              acl host_is_whoami.example.com hdr_end(host) -i whoami.example.com
+              use_backend whoami.example.com if host_is_whoami.example.com
+              #http-request redirect scheme https unless { ssl_fc }
+              #http-request redirect scheme https code 301 unless { ssl_fc }
+              http-request redirect scheme https code 302 if host_is_whoami.example.com !{ ssl_fc }
+          backend not-found
+              mode http
+          backend stats
+              server stats 127.0.0.1:1936/stats
+          listen Stats
+              bind 127.0.0.1:1936
+              mode http
+              stats enable
+              stats hide-version
+              stats uri /stats
+              stats show-legends
+              no log
+          backend whoami.example.com
+              mode http
+              balance leastconn
+              option http-keep-alive
+              option httpchk HEAD / HTTP/1.0\r\nUser-agent:\ LB-Check
+              http-check expect status 200
+              option forwardfor except 127.0.0.1
+              server whoami 127.0.0.1:8080 check
+              http-request set-header X-Real-IP %[src]
+              http-request set-header X-Forwarded-Host %[req.hdr(Host)]
+              http-request set-header X-Forwarded-Port %[dst_port]
+              http-request set-header X-Forwarded-Proto https if { ssl_fc }
+              http-request set-header X-Forwarded-Proto http if !{ ssl_fc }
+              http-response del-header server
+              http-response del-header x-powered-by
+              http-response set-header Referrer-Policy "no-referrer-when-downgrade"
+              http-response set-header X-XSS-Protection "1; mode=block"
+              http-response set-header X-Frame-Options "sameorigin"
+              http-response set-header X-Content-Type-Options "nosniff"
+              http-response set-header Set-Cookie "HttpOnly;Secure"
+              http-response set-header Content-Security-Policy ""
+              http-response set-header Strict-Transport-Security "max-age=16000000; includeSubDomains; preload;"
+        mode: 0644
+        owner: root
+        group: root
+        validate: haproxy -c -f %s
+      notify: reload haproxy
+

@@ -1,0 +1,13 @@
+local:
+  hosts:
+    localhost:
+      ansible_host: 127.0.0.1
+consul_cluster:
+  hosts:
+    consul-1:
+      ansible_host: 192.168.122.111
+    consul-2:
+      ansible_host: 192.168.122.112
+    consul-3:
+      ansible_host: 192.168.122.113
+

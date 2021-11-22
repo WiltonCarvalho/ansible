@@ -1,0 +1,219 @@
+- hosts: local
+  connection: local
+  gather_facts: no
+  vars:
+    ansible_python_interpreter: /usr/bin/python3
+    docker_compose_version: 'v2.1.1'
+  handlers:
+    - name: 'restart rsyslog'
+      service:
+        name: rsyslog
+        state: restarted
+    - name: 'restart docker'
+      service:
+        name: "{{ item }}"
+        state: restarted
+      with_items:
+        - docker.socket
+        - docker.service
+    - name: 'update grub'
+      shell: >
+        update-grub
+  tasks:
+    # - name: 'add root authorized_keys'
+    #   become: true
+    #   remote_user: ubuntu
+    #   copy:
+    #     dest: /root/.ssh/authorized_keys
+    #     content: |
+    #       ssh-rsa XXXXXXXXXXXXXXXXXXXXXXX
+    #     mode: 0600
+    #     owner: root
+    #     group: root
+    - name: '/etc/default/grub.d/99-cgroup.cfg'
+      copy:
+        dest: "/etc/default/grub.d/99-cgroup.cfg"
+        content: |
+          GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX cgroup_enable=memory swapaccount=1"
+        mode: 0644
+        owner: root
+        group: root
+      notify: update grub
+
+    - name: 'install packages'
+      apt:
+        name: "{{ packages }}"
+        update_cache: yes
+      vars:
+        packages:
+        - docker.io
+        #- linux-virtual-hwe-20.04
+
+    - name: 'docker-compose checksum'
+      shell: >
+        curl -fsSL https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-Linux-x86_64.sha256 | awk '{print $1}'
+      args:
+        warn: false
+      register: docker_compose_checksum
+
+    - name: 'docker-compose checksum stdout'
+      debug:
+        msg: "{{ docker_compose_checksum.stdout }}"
+
+    - name: '/usr/local/lib/docker/cli-plugins'
+      file: 
+        path: "/usr/local/lib/docker/cli-plugins"
+        state: directory
+
+    - name: 'Docker Compose'
+      get_url:
+        url: https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-Linux-x86_64
+        #checksum: sha256:https://github.com/docker/compose/releases/download/{{ docker_compose_version }}/docker-compose-Linux-x86_64.sha256
+        checksum: sha256:{{ docker_compose_checksum.stdout }}
+        dest: "{{ item }}"
+        mode: 0755
+        owner: root
+        group: root
+      with_items:
+        - /usr/local/lib/docker/cli-plugins/docker-compose
+        - /usr/local/bin/docker-compose
+
+    - name: 'docker compose version'
+      shell: >
+        docker version && docker compose version
+      args:
+        warn: false
+      register: docker_compose_version
+
+    - name: 'docker compose version stdout'
+      debug:
+        msg: "{{ docker_compose_version.stdout_lines }}"
+
+    - name: 'adding user docker-user to group docker'
+      user:
+        name: docker-user
+        shell: /bin/bash
+        groups: docker
+        append: yes
+
+    - name: '/etc/docker/certs.d'
+      file: 
+        path: "/etc/docker/certs.d"
+        state: directory
+
+    - name: 'docker ca check'
+      shell: test -f /etc/docker/certs.d/ca.pem
+      register: ca_check
+      failed_when: ca_check.rc > 1
+      changed_when: ca_check.rc > 0
+
+    - name: 'docker ca'
+      shell: |
+        cd /etc/docker/certs.d
+        openssl genrsa -out ca-key.pem 2048
+        openssl req -x509 -new -nodes -key ca-key.pem -days 36500 \
+        -out ca.pem -sha256 -subj '/O=Docker/CN=docker ca'
+        openssl genrsa -out server-key.pem 2048
+        openssl req -new -key server-key.pem -out server.csr -subj '/O=Docker/CN=localhost'
+        echo "extendedKeyUsage = clientAuth, serverAuth, 1.3.6.1.5.5.8.2.2" > /tmp/san.txt
+        echo "subjectAltName=IP:$(ip route get 1.1.1.1 | grep -oP 'src \K\S+'),IP:127.0.0.1,DNS:localhost,DNS:*.example.com" >> /tmp/san.txt
+        openssl x509 -req -in server.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial -days 36500 \
+        -out server-cert.pem -sha256 -extfile /tmp/san.txt
+        mkdir client
+        cp ca.pem client
+        openssl genrsa -out client/key.pem 2048
+        openssl req -subj '/CN=client' -new -key client/key.pem -out client/client.csr
+        echo extendedKeyUsage = clientAuth > /tmp/client.cnf
+        openssl x509 -req -days 36500 -sha256 -in client/client.csr -CA ca.pem -CAkey ca-key.pem -CAcreateserial \
+        -out client/cert.pem -extfile /tmp/client.cnf
+        echo 'mkdir $HOME/.docker' > client/readme.txt
+        echo 'sudo cp /etc/docker/certs.d/client/*.pem $HOME/.docker' >> client/readme.txt
+        echo 'sudo chown $USER: .docker/*.pem' >> client/readme.txt
+        echo 'export DOCKER_HOST=tcp://localhost:2376 DOCKER_TLS_VERIFY=1' >> client/readme.txt
+      when: ca_check.rc > 0
+
+    - name: '/etc/systemd/system/docker.service.d/'
+      file: 
+        path: "/etc/systemd/system/docker.service.d/"
+        state: directory
+
+    - name: '/etc/systemd/system/docker.service.d/override.conf'
+      copy:
+        dest: "/etc/systemd/system/docker.service.d/override.conf"
+        content: |
+          [Service]
+          Environment=CA_FILE=/etc/docker/certs.d/ca.pem
+          Environment=CERT_FILE=/etc/docker/certs.d/server-cert.pem
+          Environment=KEY_FILE=/etc/docker/certs.d/server-key.pem
+          ExecStart=
+          ExecStart=/usr/bin/dockerd -H fd:// -H tcp://0.0.0.0:2376 --tlsverify --tlscacert $CA_FILE --tlscert $CERT_FILE --tlskey $KEY_FILE --containerd=/run/containerd/containerd.sock
+        mode: 0644
+        owner: root
+        group: root
+      register: override_docker
+      notify:
+        - restart docker
+
+    - name: 'systemctl daemon-reload'
+      shell: >
+        systemctl daemon-reload
+      when: override_docker.changed
+      args:
+        warn: false
+
+    - name: '/etc/docker/daemon.json'
+      copy:
+        dest: "/etc/docker/daemon.json"
+        content: |
+          {% raw %}
+          {
+            "log-driver": "journald",
+            "log-opts": {
+              "tag": "{{.DaemonName}}.{{.Name}}"
+            },
+            "storage-driver": "overlay2",
+            "live-restore": false,
+            "metrics-addr": "0.0.0.0:9323",
+            "features": {
+              "buildkit": true
+            }
+          }
+          {% endraw %}
+        mode: 0644
+        owner: root
+        group: root
+      notify:
+        - restart docker
+
+    - name: '/etc/rsyslog.d/20-docker.conf'
+      copy:
+        dest: "/etc/rsyslog.d/20-docker.conf"
+        content: |
+          $template CUSTOM_LOGS,"/var/log/docker/%programname%.log"
+          if $syslogtag startswith 'docker' then ?CUSTOM_LOGS
+          & stop
+        mode: 0644
+        owner: root
+        group: root
+      notify: restart rsyslog
+
+    - name: '/etc/logrotate.d/docker'
+      copy:
+        dest: "/etc/logrotate.d/docker"
+        content: |
+          /var/log/docker/*.log
+          {
+            rotate 10
+            size 5M
+            missingok
+            notifempty
+            compress
+            delaycompress
+            sharedscripts
+            postrotate
+              /usr/lib/rsyslog/rsyslog-rotate
+            endscript
+          }
+        mode: 0644
+        owner: root
+        group: root
